@@ -333,3 +333,14 @@ class FeatureEngineer:
         except ValueError:
             raise Exception("Turbulence information could not be added.")
         return turbulence_index
+
+    def remove_duplicate_columns(self, df):
+        """Removes duplicate columns (_x and _y) after merging"""
+        for col in df.columns:
+            if col.endswith("_x") or col.endswith("_y"):
+                base_col = col[:-2]  # Remove _x or _y suffix
+                if base_col in df.columns:
+                    df.drop(columns=[col], inplace=True)  # Remove duplicate column
+                else:
+                    df.rename(columns={col: base_col}, inplace=True)  # Rename correctly
+        return df
