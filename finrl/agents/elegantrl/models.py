@@ -85,8 +85,9 @@ class DRLAgent:
                     2e5
                 )  # break training if 'total_step > break_step'
                 model.net_dims = (
-                    128,
-                    64,
+                    512, #128
+                    256, #64
+                    128 #none ends with 128
                 )  # the middle layer dimension of MultiLayer Perceptron
                 model.gamma = self.gamma  # discount factor of future rewards
                 model.horizon_len = model.max_step
