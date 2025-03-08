@@ -82,7 +82,7 @@ class DRLAgent:
         if model_kwargs is not None:
             try:
                 model.break_step = int(
-                    2e5
+                    200e5
                 )  # break training if 'total_step > break_step'
                 model.net_dims = (
                     512, #128
@@ -90,12 +90,12 @@ class DRLAgent:
                     128 #none ends with 128
                 )  # the middle layer dimension of MultiLayer Perceptron
                 model.gamma = self.gamma  # discount factor of future rewards
-                model.horizon_len = model.max_step
-                model.repeat_times = 16  # repeatedly update network using ReplayBuffer to keep critic's loss small
+                model.horizon_len = 2048#model.max_step
+                model.repeat_times = 32#16  # repeatedly update network using ReplayBuffer to keep critic's loss small
                 model.learning_rate = model_kwargs.get("learning_rate", 1e-4)
-                model.state_value_tau = 0.1  # the tau of normalize for value and state `std = (1-std)*std + tau*std`
-                model.eval_times = model_kwargs.get("eval_times", 2**5)
-                model.eval_per_step = int(2e4)
+                model.state_value_tau = 0.03 #0.1  # the tau of normalize for value and state `std = (1-std)*std + tau*std`
+                model.eval_times = model_kwargs.get("eval_times", 2**6)#model_kwargs.get("eval_times", 2**5)
+                model.eval_per_step = 5e4 #int(2e4)
             except BaseException:
                 raise ValueError(
                     "Fail to read arguments, please check 'model_kwargs' input."

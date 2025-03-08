@@ -141,6 +141,7 @@ class DRLAgent:
             if (
                 i == max_steps - 1
             ):  # more descriptive condition for early termination to clarify the logic
+
                 account_memory = test_env.env_method(method_name="save_asset_memory")
                 actions_memory = test_env.env_method(method_name="save_action_memory")
             # add current state to state memory
@@ -149,6 +150,45 @@ class DRLAgent:
             if dones[0]:
                 print("hit end!")
                 break
+        #print("account memory", account_memory, "actions memory", actions_memory)
+        return account_memory[0], actions_memory[0]
+
+    @staticmethod
+    def DRL_prediction_RandomRestart(model, environment, deterministic=True):
+        """
+        Run a single prediction episode using the given model and environment.
+        This version works with environments that reset to a random start.
+        Returns the asset memory and actions memory (for the episode).
+        """
+        # Get the vectorized environment and initial observation.
+        test_env, test_obs = environment.get_sb_env()
+
+        # Reset the environment (which now randomizes the start day)
+        reset_output = test_env.reset()
+        if isinstance(reset_output, tuple):
+            test_obs = reset_output[0]
+        else:
+            test_obs = reset_output
+
+        # Determine the episode length from the environment's settings.
+        episode_length = environment.max_episode_length
+
+        # Run the episode for the given length (or until done)
+        for i in range(episode_length):
+            action, _ = model.predict(test_obs, deterministic=deterministic)
+            test_obs, reward, dones, info = test_env.step(action)
+            if dones[0]:
+                print("Episode ended early at step", i)
+                break
+
+        # At the end of the episode, collect the asset and actions history
+        account_memory = test_env.env_method(method_name="save_asset_memory")
+        actions_memory = test_env.env_method(method_name="save_action_memory")
+
+        print("Account memory:", account_memory)
+        print("Actions memory:", actions_memory)
+
+        # Return the first (and only) instance from the vectorized env.
         return account_memory[0], actions_memory[0]
 
     @staticmethod
