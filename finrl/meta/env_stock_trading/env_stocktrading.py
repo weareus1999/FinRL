@@ -2311,7 +2311,7 @@ class StockTradingTransformerEnv(gym.Env):
 
 
 
-class PricePredictionEnvNoRandom(gym.Env):
+class PricePredictionEnvNoRandomOld(gym.Env):
     """
     A simplified environment for price prediction (non-random start).
     The agent’s action is a single float representing the predicted price.
@@ -2418,6 +2418,7 @@ class PricePredictionEnvNoRandom(gym.Env):
         else:
             prev_close_price = 415
         #predicted_price = float(action[0])
+        print("actionis", action[0])
         predicted_price = (float(action[0])+1.0)/2.0 * prev_close_price
 
         actual_price = float(self.df.loc[self.current_step, "close"])
@@ -2452,6 +2453,169 @@ class PricePredictionEnvNoRandom(gym.Env):
         return env, obs
 
 
+class PricePredictionEnvNoRandom(gym.Env):
+    """
+    A simplified environment for price prediction without random starts.
+    This environment is intended for inference/prediction. It always starts at a fixed
+    row (start_idx) and proceeds chronologically until the end of the episode.
+
+    Observations: A vector of technical indicators for the current day.
+    Action: A single float (normalized in [-1,1]) representing the predicted price.
+    Reward: Based on the prediction error (using an exponential or linear function) and
+            an extra penalty for a large change between consecutive predictions.
+    """
+
+    def __init__(self, df: pd.DataFrame, tech_indicator_list: list[str],
+                 reward_type: str = "exp", reward_scale: float = 1.0,
+                 start_idx: int = 0, max_episode_length: int = None,
+                 penalty_factor: float = 0.0001, deviation_factor: float = 0.01,):
+        """
+        Args:
+            df: DataFrame with at least 'date' and 'close' columns plus technical indicator columns.
+            tech_indicator_list: List of column names used as features.
+            reward_type: "exp" for exponential reward or "linear" for negative absolute error.
+            reward_scale: Scale factor used in the reward function.
+            start_idx: Row index in df at which to start the episode.
+            max_episode_length: Maximum number of steps in an episode (if None, run until the end of df).
+            penalty_factor: Factor that scales the penalty applied for large changes between consecutive predictions.
+        """
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.tech_indicator_list = tech_indicator_list
+        self.reward_type = reward_type.lower()
+        self.reward_scale = reward_scale
+        self.start_idx = start_idx
+        self.max_episode_length = max_episode_length
+        self.penalty_factor = penalty_factor
+        self.deviation_factor = deviation_factor
+
+        # Ensure required columns exist
+        for col in ["date", "close"]:
+            if col not in self.df.columns:
+                raise ValueError(f"DataFrame must contain '{col}' column.")
+
+        # Observation space: one float per technical indicator.
+        obs_dim = len(tech_indicator_list)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+
+        # Action space: one float in [-1,1]. We'll later scale it to a predicted price.
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+
+        # Internal state variables
+        self._seed()
+        self.current_step = self.start_idx
+        self.terminal = False
+        self.end_idx = len(self.df) - 1
+        if self.max_episode_length is not None:
+            self.end_idx = min(self.end_idx, self.start_idx + self.max_episode_length - 1)
+
+        # For logging predictions vs. actual prices
+        self.predictions = []
+        self.actuals = []
+        # Track the previous predicted price; initialize it during reset.
+        self.prev_predicted_price = None
+
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def _get_observation(self):
+        """Construct the observation from the tech indicators in the current row."""
+        row = self.df.loc[self.current_step]
+        obs = [row[col] for col in self.tech_indicator_list]
+        return np.array(obs, dtype=np.float32)
+
+    def _get_reward(self, predicted_price: float, actual_price: float) -> float:
+        """
+        Compute the base reward based on prediction error.
+        For 'exp' reward_type, reward = exp(-error/reward_scale).
+        For 'linear', reward = -error.
+        """
+        error = abs(predicted_price - actual_price)
+        if self.reward_type == "exp":
+            #reward = np.exp(-error / self.reward_scale)
+            reward = 1 / error if error > 0 else 10e5
+
+        elif self.reward_type == "linear":
+            reward = -error
+        else:
+            reward = -error
+        return reward
+
+    def reset(self, *, seed=None, options=None):
+        """
+        Reset the environment to the fixed start index. Also initialize logs and the previous prediction.
+        """
+        self.terminal = False
+        self.current_step = self.start_idx
+        self.predictions = []
+        self.actuals = []
+        # For the first step, we initialize the previous predicted price with the actual close price.
+        self.prev_predicted_price = float(self.df.loc[self.current_step, "close"])
+        return self._get_observation(), {}
+
+    def step(self, action):
+        """
+        Execute one step: scale the action using the previous predicted price as baseline,
+        compute reward (including a penalty for large day-to-day changes in prediction),
+        log predictions, and move to the next row.
+        """
+
+        # Use the previous day's predicted price as the baseline for scaling.
+        baseline = self.prev_predicted_price if self.prev_predicted_price is not None else float(self.df.loc[self.current_step, "close"])
+
+        # Scale the action (assumed in [-1,1]) to a predicted price.
+        # For example, map [-1,1] to [0, 2*baseline]:
+        alpha = (float(action[0]) + 1.0) / 2.0  # transforms to [0,1]
+        #print("actionis", action[0])
+
+        predicted_price = alpha * 1000#* baseline
+
+        # Get actual price at current step
+        actual_price = float(self.df.loc[self.current_step, "close"])
+
+        # Log the prediction and actual price
+        self.predictions.append(predicted_price)
+        self.actuals.append(actual_price)
+
+        # Compute base reward using the error
+        reward = self._get_reward(predicted_price, actual_price)
+        reward0 = reward
+        # Add penalty if the difference between today's prediction and yesterday's prediction is large
+        if baseline is not None:
+            diff = 1/(abs(predicted_price - baseline) + 1e-9)
+            reward = self.deviation_factor*reward + self.penalty_factor * diff
+
+        # Update the previous predicted price for the next step
+        self.prev_predicted_price = predicted_price
+
+        # Advance to next time step
+        self.current_step += 1
+
+        # Check if the episode is done
+        done = self.current_step > self.end_idx
+
+        # Get next observation (or a dummy observation if done)
+        if done:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        else:
+            obs = self._get_observation()
+        print("vitals:", "action:", action[0], ", reward0:", reward0, "reward:", reward,
+              "predicted_price:", predicted_price, "actual_price:", actual_price)
+        return obs, reward, done, {}
+        #return obs, float(reward), done, False, {}
+
+    def render(self, mode="human"):
+        pass
+
+    def get_sb_env(self):
+        """Wrap the environment in a DummyVecEnv for use with Stable-Baselines3."""
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        env = DummyVecEnv([lambda: self])
+        obs = env.reset()
+        return env, obs
+
+
 import random
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -2463,7 +2627,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-class PricePredictionEnvRandomStarts(gym.Env):
+class PricePredictionEnvRandomStartsOld(gym.Env):
     """
     A simplified price prediction environment with random episode start dates.
 
@@ -2476,7 +2640,7 @@ class PricePredictionEnvRandomStarts(gym.Env):
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, df: pd.DataFrame, tech_indicator_list: list[str],
-                 max_episode_length: int = 60, reward_type: str = "exp"):
+                 max_episode_length: int = 60, reward_type: str = "exp", penalty_factor: float = 0.001):
         """
         Args:
             df: DataFrame with columns including 'date', 'close', and the technical indicators.
@@ -2489,6 +2653,7 @@ class PricePredictionEnvRandomStarts(gym.Env):
         self.tech_indicator_list = tech_indicator_list
         self.max_episode_length = max_episode_length
         self.reward_type = reward_type.lower()
+        self.penalty_factor = penalty_factor
 
         # Get unique dates from the DataFrame (assumes daily data)
         self.unique_dates = sorted(self.df["date"].unique())
@@ -2588,7 +2753,7 @@ class PricePredictionEnvRandomStarts(gym.Env):
         else:
             prev_close_price = 415
         #predicted_price = float(action[0])
-        predicted_price = (float(action[0]) + 1.0)/2.0 * prev_close_price
+        predicted_price = (float(action[0]) + 1.0)/2.0 * 415
 
         actual_price = float(self.df.loc[self.current_step, "close"])
         self.predictions.append(predicted_price)
@@ -2601,8 +2766,7 @@ class PricePredictionEnvRandomStarts(gym.Env):
             # Day-to-day difference in predicted prices
             day_to_day_diff = abs(predicted_price - prev_close_price)
             # Example penalty: 0.01 * difference
-            penalty_factor = 0.01
-            penalty = penalty_factor * day_to_day_diff
+            penalty = self.penalty_factor * day_to_day_diff
             # Subtract penalty from reward
             reward -= penalty
 
@@ -2626,4 +2790,205 @@ class PricePredictionEnvRandomStarts(gym.Env):
         env = DummyVecEnv([lambda: self])
         obs = env.reset()
         return env, obs
+
+class PricePredictionEnvRandomStarts(gym.Env):
+    """
+    A simplified price prediction environment with random episode start dates.
+
+    Observations:
+        - A vector of technical indicators for the current day.
+
+    Action:
+        - A single float representing the predicted price (scaled from [-1,1] to some range).
+
+    Reward:
+        - By default, uses an exponential-like reward or negative error.
+        - Additional penalty can be applied if the predicted price changes too drastically
+          compared to the previous day's predicted price.
+
+    Random Starts:
+        - Each episode begins at a random day in the dataset.
+    """
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, df, tech_indicator_list, max_episode_length=60, reward_type="exp",
+                 penalty_factor=0.0001, deviation_factor = 0.01,  **kwargs):
+        """
+        Args:
+            df: DataFrame with columns including 'date', 'close', and the technical indicators.
+            tech_indicator_list: List of columns (features) used for prediction.
+            max_episode_length: Maximum number of days (steps) per episode.
+            reward_type: 'exp' for exponential reward, 'linear' for a linear reward, or fallback to negative error.
+        """
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.tech_indicator_list = tech_indicator_list
+        self.max_episode_length = max_episode_length
+        self.reward_type = reward_type.lower()
+        self.penalty_factor = penalty_factor
+        self.deviation_factor = deviation_factor
+
+        # Get unique dates from the DataFrame (assumes daily data)
+        self.unique_dates = sorted(self.df["date"].unique())
+        self.num_days = len(self.unique_dates)
+
+        # Observation space: one value per indicator
+        obs_dim = len(tech_indicator_list)
+        print("obs_dimRandom", obs_dim)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+
+        # Action space: single predicted price in [-1,1], which we'll scale.
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(1,), dtype=np.float32
+        )
+
+        # Internal states
+        self._seed()
+        self.current_step = 0
+        self.start_day_idx = 0
+        self.terminal = False
+        self.episode = 0
+
+        # For logging predictions vs. actual prices
+        self.predictions = []
+        self.actuals = []
+
+        # Track the previous day's predicted price
+        self.prev_predicted_price = None
+
+    def _seed(self, seed=None):
+        """Ensure compatibility with NumPy's newer random API."""
+        self.np_random, seed = seeding.np_random(seed)
+        # If the returned object is not a Generator, convert it
+        if not isinstance(self.np_random, np.random.Generator):
+            self.np_random = np.random.default_rng(seed)
+        return [seed]
+
+    def _get_observation(self):
+        """Return the current observation as a numpy array of tech indicator values."""
+        row = self.df.loc[self.current_step]
+        obs = [row[col] for col in self.tech_indicator_list]
+        return np.array(obs, dtype=np.float32)
+
+    def _get_reward(self, predicted_price: float, actual_price: float) -> float:
+        """
+        Compute reward.
+        Example: an exponential-like function or negative error.
+        """
+        error = abs(predicted_price - actual_price)
+        if self.reward_type == "exp":
+            # Simple example: larger is better, so 1/error can be used, or e^(-error)
+            return 1 / error if error > 1e-9 else 10e5  # or np.exp(-error / scale)
+            #return -error
+        elif self.reward_type == "linear":
+            # A linear style: reward ~ 1 - (error / something)
+            # This can clip below 0 if error is large.
+            return max(0.0, 1.0 - error / max(1.0, actual_price))
+        else:
+            # Default: negative absolute error
+            return -error
+
+    def reset(self, *, seed=None, options=None):
+        """Reset the environment with a random start date."""
+        self.terminal = False
+        self.episode += 1
+
+        # Validate max_episode_length
+        if self.max_episode_length > self.num_days:
+            print(
+                f"⚠️ max_episode_length ({self.max_episode_length}) "
+                f"exceeds number of unique days ({self.num_days}). Adjusting."
+            )
+            self.max_episode_length = self.num_days
+
+        # Random start day index
+        max_start = max(0, self.num_days - self.max_episode_length)
+        if max_start > 0:
+            self.start_day_idx = self.np_random.integers(0, max_start + 1)
+        else:
+            self.start_day_idx = 0
+
+        start_date = self.unique_dates[self.start_day_idx]
+        matching_rows = self.df[self.df["date"] == start_date]
+        if len(matching_rows) == 0:
+            raise ValueError(f"❌ No rows found for start_date {start_date}. Check your data.")
+
+        self.current_step = matching_rows.index[0]
+
+        # Reset logs
+        self.predictions = []
+        self.actuals = []
+        self.prev_predicted_price = None  # Reset for new episode
+
+        obs = self._get_observation()
+        return obs, {}
+
+    def step(self, action):
+        """
+        Execute one timestep: record the prediction, compute reward, and advance one day.
+        Additionally, penalize large changes in the predicted price from the previous day.
+        """
+        # Use previous day's close for scaling, since that value is known when making the prediction.
+        if self.current_step > 0 and self.prev_predicted_price:
+            prev_predicted_price = self.prev_predicted_price #float(self.df.loc[self.current_step - 1, "close"])
+        else:
+            # For the very first step, if no previous data is available, you can choose a default value.
+            prev_predicted_price = 415.0#float(self.df.loc[self.current_step, "close"])
+
+        # Scale the raw action from [-1,1] to a predicted price range based on the previous day's close.
+        # For example, if we want predictions to be roughly in the range [0, 2*prev_close]:
+        alpha = (float(action[0]) + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+        predicted_price = alpha *  1000 #prev_predicted
+
+        # Get the actual price for reward calculation (this is the true value, revealed after prediction)
+        actual_price = float(self.df.loc[self.current_step, "close"])
+
+        # Log predictions vs. actuals
+        self.predictions.append(predicted_price)
+        self.actuals.append(actual_price)
+
+        # Compute base reward using your chosen reward function (e.g., exponential decay, negative error, etc.)
+        reward = self._get_reward(predicted_price, actual_price)
+        # Optionally, add a penalty for large changes in predicted price relative to the previous prediction.
+        if prev_predicted_price is not None:
+            day_to_day_diff = 1/(abs(predicted_price - prev_predicted_price) + 1e-9)
+            penalty = self.penalty_factor * day_to_day_diff
+            reward = self.deviation_factor * reward +  penalty
+
+        # Update the stored previous predicted price for next step.
+        self.prev_predicted_price = predicted_price
+
+        # Advance to the next day
+        self.current_step += 1
+
+        # Check if episode is done (either end of data or reached max_episode_length)
+        if self.current_step >= len(self.df) - 1:
+            done = True
+        else:
+            current_date = self.df.loc[self.current_step, "date"]
+            day_idx = self.unique_dates.index(current_date)
+            day_offset = day_idx - self.start_day_idx
+            done = (day_offset >= self.max_episode_length - 1)
+
+        # Get the new observation (or return a dummy observation if done)
+        if done:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        else:
+            obs = self._get_observation()
+
+        return obs, float(reward), done, False, {}
+
+    def render(self, mode="human"):
+        pass
+
+    def get_sb_env(self):
+        """Wrap in DummyVecEnv for Stable-Baselines3 usage."""
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        env = DummyVecEnv([lambda: self])
+        obs = env.reset()
+        return env, obs
+
 
