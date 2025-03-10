@@ -75,4 +75,10 @@ class FactorTimingEnv(gym.Env):
         return next_obs, reward, terminated, truncated, info
 
     def render(self, mode="human"):
-        print(f"Step: {self.current_step}, Cash: {self.cash:.2f}, Last Action: {self.last_action}")
+        # Get the current date from the data index if available; otherwise, indicate the episode is over.
+        if self.current_step < len(self.data):
+            current_date = self.data.index[self.current_step]
+        else:
+            current_date = "End"
+        print(
+            f"Step: {self.current_step}, Date: {current_date}, Cash: {self.cash:.2f}, Last Action: {self.last_action}")
