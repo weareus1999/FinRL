@@ -999,6 +999,7 @@ class StockTradingEnvRandomStarts(gym.Env):
     def reset(self, *, seed=None, options=None):
         """Randomize the start day and reset the environment for a new episode."""
         # Randomly choose a starting day index such that there are enough days left for an episode.
+        #print("len of unique days: ", len(self.unique_days))
         max_start = len(self.unique_days) - self.max_episode_length
         self.start_day = random.randint(0, max_start)
         self.end_day = self.start_day + self.max_episode_length
