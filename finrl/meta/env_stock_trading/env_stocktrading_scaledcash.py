@@ -52,13 +52,15 @@ class StockTradingEnv(gym.Env):
         iteration="",
         sharpe_factor=0.5,
         returns_factor=0.5,
+        cash_scaling=1e-3
     ):
+        self.cash_scaling = cash_scaling
         self.day = day
         self.df = df
         self.stock_dim = stock_dim
         self.hmax = hmax
         self.num_stock_shares = num_stock_shares
-        self.initial_amount = initial_amount  # get the initial cash
+        self.initial_amount = initial_amount * self.cash_scaling  # get the initial cash
         self.buy_cost_pct = buy_cost_pct
         self.sell_cost_pct = sell_cost_pct
         self.reward_scaling = reward_scaling
@@ -91,7 +93,7 @@ class StockTradingEnv(gym.Env):
         self.episode = 0
         # memorize all the total balance change
         self.asset_memory = [
-            self.initial_amount
+            self.initial_amount/self.cash_scaling,
             + np.sum(
                 np.array(self.num_stock_shares)
                 * np.array(self.state[1 : 1 + self.stock_dim])
@@ -157,7 +159,7 @@ class StockTradingEnv(gym.Env):
                         * (1 - self.sell_cost_pct[index])
                     )
                     # update balance
-                    self.state[0] += sell_amount
+                    self.state[0] = self.state[0] + sell_amount
 
                     self.state[index + self.stock_dim + 1] -= sell_num_shares
                     self.cost += (
@@ -214,7 +216,7 @@ class StockTradingEnv(gym.Env):
             ):  # check if the stock is able to buy
                 # if self.state[index + 1] >0:
                 # Buy only if the price is > 0 (no missing data in this particular date)
-                available_amount = self.state[0] // (
+                available_amount = (self.state[0]/self.cash_scaling)// (
                     self.state[index + 1] * (1 + self.buy_cost_pct[index])
                 )  # when buying stocks, we should consider the cost of trading when calculating available_amount, or we may be have cash<0
                 # print('available_amount:{}'.format(available_amount))
@@ -1206,6 +1208,905 @@ class StockTradingEnvRandomStarts(gym.Env):
         return [seed]
 
     def get_sb_env(self):
+        e = DummyVecEnv([lambda: self])
+        obs = e.reset()
+        return e, obs
+
+from scipy.stats import multivariate_normal  # if needed for later calculations
+
+
+class StockTradingEnvPrescaled(gym.Env):
+    """
+    Stock Trading Environment with Fixed Start (day 0), Cash Prescaling, and Reward Scaling.
+
+    Internally, all trading calculations use the actual (unscaled) cash (e.g. 1e6).
+    However, the observation returned to the RL agent reports cash as:
+
+        scaled_cash = actual_cash / cash_scaling
+
+    Moreover, the reward (change in total asset) is divided by cash_scaling so that the target
+    values are on a similar scale. This environment always starts at day 0.
+
+    In multi-stock mode, the state is assumed to be composed as follows:
+      state = [scaled_cash] + close_prices + current_holdings + tech_indicator_values
+    where close_prices and current_holdings are lists of length N (number of stocks), and
+    tech_indicator_values is the concatenation of the values for each indicator for each stock.
+
+    Thus the expected state dimension is:
+      state_space = 1 + 2*N + (len(tech_indicator_list) * N)
+    """
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(
+            self,
+            df: pd.DataFrame,
+            stock_dim: int,
+            hmax: int,
+            initial_amount: int,
+            num_stock_shares: list,
+            buy_cost_pct: list,
+            sell_cost_pct: list,
+            reward_scaling: float,
+            state_space: int,
+            action_space: int,
+            tech_indicator_list: list,
+            turbulence_threshold=None,
+            risk_indicator_col="turbulence",
+            make_plots: bool = False,
+            print_verbosity: int = 10,
+            initial: bool = True,
+            previous_state=[],
+            model_name: str = "",
+            mode: str = "",
+            iteration: str = "",
+            sharpe_factor: float = 0.5,
+            returns_factor: float = 0.5,
+            max_episode_length: int = 90,  # number of days per episode
+            cash_scaling: float = 1000.0  # RL sees cash = actual_cash / cash_scaling
+    ):
+        super().__init__()
+        self.cash_scaling = cash_scaling
+
+        # Store the dataframe (assumed to be preprocessed so that in multi-stock mode,
+        # each date appears multiple times, one row per stock)
+        self.df = df.copy()
+        self.stock_dim = stock_dim
+        self.hmax = hmax
+        self.num_stock_shares = num_stock_shares
+
+        # Save the original (unscaled) cash for trading calculations.
+        self.actual_cash = initial_amount
+        self.original_cash = initial_amount
+        self.buy_cost_pct = buy_cost_pct
+        self.sell_cost_pct = sell_cost_pct
+        self.reward_scaling = reward_scaling
+        self.state_space = state_space  # Expected length of state vector.
+        self.action_space_dim = action_space
+        self.tech_indicator_list = tech_indicator_list
+
+        # Define action and observation spaces.
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.action_space_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_space,), dtype=np.float32)
+
+        # Fixed start at day 0.
+        self.day = 0
+        # In multi-stock mode, we expect that all rows corresponding to day 0 have the same date.
+        # Here we use .loc with the index 0 if multi-stock; if single-stock, self.data is a Series.
+        # if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+        #     self.data = self.df[self.df["date"] == self.df.iloc[0]["date"]]
+        # else:
+        #     self.data = self.df.iloc[0]
+        #print("beforedf", df)
+        self.data = self.df.loc[self.day, :]
+        #print("afterdf", self.data, self.day)
+        self.unique_days = np.array(sorted(self.df["date"].unique()))
+        print("UNQEDAYS", len(self.unique_days))
+        self.max_episode_length = max_episode_length  # Could be set to len(df) for full episode
+
+        self.turbulence_threshold = turbulence_threshold
+        self.risk_indicator_col = risk_indicator_col
+        self.make_plots = make_plots
+        self.print_verbosity = print_verbosity
+        self.initial = initial
+        self.previous_state = previous_state
+        self.model_name = model_name
+        self.mode = mode
+        self.iteration = iteration
+        self.sharpe_factor = sharpe_factor
+        self.returns_factor = returns_factor
+        self.short_term_factor = 0.0
+        self.activity_factor = 0.001
+        self.inactivity_penalty = 0.1
+
+        self._seed()
+
+        self.terminal = False
+        self.episode = 0
+
+        # Initialize the state (observation); note that cash is scaled.
+        print("calling from init")
+        self.state = self._initiate_state()
+
+        # Compute the initial total asset using unscaled cash and current holdings.
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            # In multi-stock mode, assume self.data is a DataFrame.
+            holdings_value = np.sum(np.array(self.num_stock_shares) * np.array(self.data["close"].values.tolist()))
+        else:
+            holdings_value = np.sum(np.array(self.num_stock_shares) * np.array([self.data.close]))
+        self.asset_memory = [self.actual_cash + holdings_value]
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = []
+        self.date_memory = [self._get_date()]
+
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def _initiate_state(self):
+        """
+        Construct the initial state vector.
+        The first element is the scaled cash: actual_cash / cash_scaling.
+        Then follow the close prices, current stock holdings, and technical indicator values.
+        In multi-stock mode, self.data is assumed to be a DataFrame containing all stocks for the current date.
+        """
+        '''
+        scaled_cash = self.actual_cash / self.cash_scaling
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            # Multiple stocks.
+            close_prices = self.data["close"].values.tolist() if hasattr(self.data["close"], "values") else [
+                self.data["close"]]
+            tech_data = []
+            for tech in self.tech_indicator_list:
+                tech_vals = self.data[tech].values.tolist() if hasattr(self.data[tech], "values") else [self.data[tech]]
+                tech_data.extend(tech_vals)
+            state = [scaled_cash] + close_prices + self.num_stock_shares + tech_data
+        else:
+            # Single stock.
+            state = ([scaled_cash] +
+                     [self.data.close] +
+                     [0] * self.stock_dim +
+                     sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        return state
+        '''
+        print("In intitial state", self.data)
+        if self.initial:
+            if len(self.df.tic.unique()) > 1:
+                # Multiple stocks:
+                close_prices = self.data.close.values.tolist() if hasattr(self.data.close, "values") else [
+                    self.data.close]
+                tech_data = []
+                for tech in self.tech_indicator_list:
+                    if hasattr(self.data[tech], "values"):
+                        tech_data.extend(self.data[tech].values.tolist())
+                    else:
+                        tech_data.append(self.data[tech])
+                state = ([self.actual_cash / self.cash_scaling] + close_prices + self.num_stock_shares + tech_data)
+            else:
+                # Single stock:
+                state = ([self.actual_cash / self.cash_scaling] +
+                         [self.data.close] +
+                         [0] * self.stock_dim +
+                         sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        else:
+            if len(self.df.tic.unique()) > 1:
+                if hasattr(self.data.close, "values"):
+                    close_prices = self.data.close.values.tolist()
+                else:
+                    close_prices = [self.data.close]
+                tech_data = []
+                for tech in self.tech_indicator_list:
+                    if hasattr(self.data[tech], "values"):
+                        tech_data.extend(self.data[tech].values.tolist())
+                    else:
+                        tech_data.append(self.data[tech])
+                state = ([self.previous_state[0]] + close_prices +
+                         self.previous_state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)] + tech_data)
+            else:
+                state = ([self.previous_state[0]] +
+                         [self.data.close] +
+                         self.previous_state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)] +
+                         sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        print("lenofstate", len(state))
+        return state
+
+    def _update_state(self):
+        """
+        Update the state vector for the new day.
+        The observation returns the scaled cash as the first element.
+        """
+        scaled_cash = self.actual_cash / self.cash_scaling
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            state = ([scaled_cash] +
+                     self.data["close"].values.tolist() +
+                     list(self.state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)]) +
+                     sum((self.data[tech].values.tolist() for tech in self.tech_indicator_list), []))
+        else:
+            state = ([scaled_cash] +
+                     [self.data.close] +
+                     list(self.state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)]) +
+                     sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        return state
+
+    def _get_date(self):
+        """Return the current date from the data row.
+           In multi-stock mode, self.data is a DataFrame and we take the unique date from its 'date' column.
+        """
+        """
+                if len(self.df.tic.unique()) > 1:
+            date_val = self.data.date
+            if hasattr(date_val, "unique"):
+                date = self.data.date.unique()[0]
+            else:
+                date = date_val
+        else:
+            date = self.data.date
+        return date
+        """
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            date_val = self.data["date"]
+            if hasattr(date_val, "unique"):
+                return date_val.unique()[0]
+            else:
+                return date_val
+        else:
+            return self.data.date
+
+    def _sell_stock(self, index, action):
+        """Execute a sell order and update actual cash."""
+
+        def _do_sell_normal():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+                if self.state[index + self.stock_dim + 1] > 0:
+                    sell_num_shares = min(abs(action), self.state[index + self.stock_dim + 1])
+                    sell_amount = self.state[index + 1] * sell_num_shares * (1 - self.sell_cost_pct[index])
+                    self.actual_cash += sell_amount
+                    self.state[index + self.stock_dim + 1] -= sell_num_shares
+                    self.cost += self.state[index + 1] * sell_num_shares * self.sell_cost_pct[index]
+                    self.trades += 1
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = 0
+            return sell_num_shares
+
+        if self.turbulence_threshold is not None:
+            if self.turbulence >= self.turbulence_threshold:
+                if self.state[index + 1] > 0:
+                    if self.state[index + self.stock_dim + 1] > 0:
+                        sell_num_shares = self.state[index + self.stock_dim + 1]
+                        sell_amount = self.state[index + 1] * sell_num_shares * (1 - self.sell_cost_pct[index])
+                        self.actual_cash += sell_amount
+                        self.state[index + self.stock_dim + 1] = 0
+                        self.cost += self.state[index + 1] * sell_num_shares * self.sell_cost_pct[index]
+                        self.trades += 1
+                    else:
+                        sell_num_shares = 0
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = _do_sell_normal()
+        else:
+            sell_num_shares = _do_sell_normal()
+        return sell_num_shares
+
+    def _buy_stock(self, index, action):
+        """Execute a buy order and update actual cash."""
+
+        def _do_buy():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+                available_amount = self.actual_cash // (self.state[index + 1] * (1 + self.buy_cost_pct[index]))
+                buy_num_shares = min(available_amount, action)
+                buy_amount = self.state[index + 1] * buy_num_shares * (1 + self.buy_cost_pct[index])
+                self.actual_cash -= buy_amount
+                self.state[index + self.stock_dim + 1] += buy_num_shares
+                self.cost += self.state[index + 1] * buy_num_shares * self.buy_cost_pct[index]
+                self.trades += 1
+            else:
+                buy_num_shares = 0
+            return buy_num_shares
+
+        if self.turbulence_threshold is None:
+            buy_num_shares = _do_buy()
+        else:
+            if self.turbulence < self.turbulence_threshold:
+                buy_num_shares = _do_buy()
+            else:
+                buy_num_shares = 0
+        return buy_num_shares
+
+    def step(self, actions):
+        """
+        Take an action for one day, update state and compute scaled reward.
+        Returns:
+            (state, reward, done, truncated, info)
+        """
+
+        def compute_sharpe_ratio(returns):
+            return np.mean(returns) / (np.std(returns) + 1e-9)
+
+        # Fixed start: we use the day index directly.
+        if self.day >= self.max_episode_length - 1 or self.day >= len(self.df)//self.stock_dim- 1:
+            return self.state, 0.0, True, False, {}
+
+        actions = actions * self.hmax
+        actions = actions.astype(int)
+        actions = np.atleast_1d(actions)
+
+        # Compute initial total asset (using actual cash).
+        begin_total_asset = self.actual_cash + np.sum(
+            np.array(self.state[1:1 + self.stock_dim]) *
+            np.array(self.state[self.stock_dim + 1:self.stock_dim * 2 + 1])
+        )
+
+        # Process sell orders.
+        for index in np.argsort(actions)[:np.where(actions < 0)[0].shape[0]]:
+            actions[index] = self._sell_stock(index, actions[index]) * (-1)
+        # Process buy orders.
+        for index in np.argsort(actions)[::-1][:np.where(actions > 0)[0].shape[0]]:
+            actions[index] = self._buy_stock(index, actions[index])
+
+        self.day += 1
+        if self.day >= len(self.df)//self.stock_dim:
+            return self.state, 0.0, True, False, {}
+
+        #self.data = self.df.iloc[self.day]
+        self.data = self.df.loc[self.day, :]
+        # if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+        #     self.data = self.df[self.df["date"] == self.df.iloc[self.day]["date"]]
+        # else:
+        #     self.data = self.df.iloc[0]
+        self.state = self._update_state()
+
+        # Compute new total asset.
+        end_total_asset = self.actual_cash + np.sum(
+            np.array(self.state[1:1 + self.stock_dim]) *
+            np.array(self.state[self.stock_dim + 1:self.stock_dim * 2 + 1])
+        )
+        trade_profit = end_total_asset - begin_total_asset
+        trading_cost_penalty = self.cost * 0.01
+        immediate_reward = trade_profit - trading_cost_penalty
+
+        if len(self.rewards_memory) > 1:
+            returns = np.diff(self.asset_memory) / np.array(self.asset_memory[:-1])
+            sharpe_reward = compute_sharpe_ratio(returns)
+        else:
+            sharpe_reward = 0
+
+        portfolio_reward = self.returns_factor * immediate_reward + self.sharpe_factor * sharpe_reward
+
+        # Scale the reward so that it is consistent with scaled cash.
+        reward = (portfolio_reward / self.cash_scaling) * self.reward_scaling
+        reward = np.clip(reward, -10, 10)
+        self.reward = reward
+
+        self.asset_memory.append(end_total_asset)
+        self.rewards_memory.append(self.reward)
+        self.state_memory.append(self.state)
+        self.date_memory.append(self._get_date())
+        self.actions_memory.append(actions.tolist())
+
+        info = {"current_obs": self.state,
+                "date": pd.to_datetime(self._get_date()).strftime("%Y-%m-%d")}
+        return self.state, self.reward, False, False, info
+
+    def reset(self, *, seed=None, options=None):
+        """
+        Reset the environment for a new episode.
+        Fixed start: always start at day 0.
+        """
+
+        self.day = 0
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            self.data = self.df[self.df["date"] == self.df.iloc[0]["date"]]
+        else:
+            self.data = self.df.iloc[0]
+        self.terminal = False
+        self.episode += 1
+
+        # Reset actual cash to the original unscaled value.
+        self.actual_cash = self.original_cash
+        print("Calling from reset", self.data)
+        self.state = self._initiate_state()
+        self.reward = 0
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+
+        # if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+        #     holdings_value = np.sum(np.array(self.num_stock_shares) * np.array(self.data["close"].values.tolist()))
+        # else:
+        #     holdings_value = np.sum(np.array(self.num_stock_shares) * np.array([self.data.close]))
+        self.asset_memory =  [self.actual_cash +
+                             np.sum(np.array(self.num_stock_shares) * np.array(self.state[1:1 + self.stock_dim]))]
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = []
+        self.date_memory = [self._get_date()]
+
+        return self.state, {}
+        '''
+        """
+                Reset the environment for a new episode.
+                Randomly select a start day such that there are enough days for the episode.
+                """
+        max_start = len(self.unique_days) - self.max_episode_length
+        self.start_day = np.random.randint(0, max_start)
+        self.end_day = self.start_day + self.max_episode_length
+
+        start_date = self.unique_days[self.start_day]
+        start_rows = self.df[self.df["date"] == start_date]
+        if len(start_rows) == 0:
+            raise ValueError("No rows found for start_date. Check your data.")
+        self.day = start_rows.index[0]
+
+        self.terminal = False
+        self.episode += 1
+        self.data = self.df.loc[self.day, :]
+
+        # Reset actual cash to the original unscaled value.
+        self.actual_cash = self.original_cash
+
+        self.state = self._initiate_state()
+        self.reward = 0
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+
+        self.asset_memory = [self.actual_cash +
+                             np.sum(np.array(self.num_stock_shares) * np.array(self.state[1:1 + self.stock_dim]))]
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = []
+        self.date_memory = [self._get_date()]
+
+        return self.state, {}
+    '''
+
+    def render(self, mode="human", close=False):
+        return self.state
+
+    def save_state_memory(self):
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            df_date = pd.DataFrame(self.date_memory[:-1], columns=["date"])
+            df_states = pd.DataFrame(self.state_memory)
+            df_states.index = df_date["date"]
+        else:
+            df_states = pd.DataFrame({"date": self.date_memory[:-1], "states": self.state_memory})
+        return df_states
+
+    def save_asset_memory(self):
+        return pd.DataFrame({"date": self.date_memory, "account_value": self.asset_memory})
+
+    def save_action_memory(self):
+        min_length = min(len(self.date_memory), len(self.actions_memory))
+        if min_length == 0:
+            return pd.DataFrame(columns=["date", "actions"])
+        date_list = self.date_memory[:min_length]
+        action_list = self.actions_memory[:min_length]
+        if "tic" in self.df.columns and len(self.df.tic.unique()) > 1:
+            df_date = pd.DataFrame({"date": date_list})
+            df_actions = pd.DataFrame(action_list)
+            if df_actions.shape[1] == len(self.data["tic"].values):
+                df_actions.columns = self.data["tic"].values
+            else:
+                df_actions.columns = [f"Stock_{i}" for i in range(df_actions.shape[1])]
+            df_actions.index = df_date["date"]
+        else:
+            df_actions = pd.DataFrame({"date": date_list, "actions": action_list})
+        print(f"🔹 Saved {len(df_actions)} action records.")
+        return df_actions
+
+    def get_sb_env(self):
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        e = DummyVecEnv([lambda: self])
+        obs = e.reset()
+        return e, obs
+
+
+# (If needed, import your indicator utilities such as BollingerBands, etc.)
+
+
+
+
+class StockTradingEnvRandomStartsPrescaled(gym.Env):
+    """
+    Stock Trading Environment with Random Starts and Prescaled Cash.
+
+    Internally, trading is done using the actual (unscaled) cash (e.g. 1e6).
+    However, the observation provided to the RL agent reports cash as:
+
+        scaled_cash = actual_cash / cash_scaling
+
+    Moreover, the reward signal (i.e. change in total asset) is also scaled by dividing
+    by cash_scaling so that both the observation and target values are on similar scales.
+    """
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(
+            self,
+            df: pd.DataFrame,
+            stock_dim: int,
+            hmax: int,
+            initial_amount: int,
+            num_stock_shares: list,
+            buy_cost_pct: list,
+            sell_cost_pct: list,
+            reward_scaling: float,
+            state_space: int,
+            action_space: int,
+            tech_indicator_list: list,
+            turbulence_threshold=None,
+            risk_indicator_col="turbulence",
+            make_plots: bool = False,
+            print_verbosity: int = 10,
+            day: int = 0,
+            initial: bool = True,
+            previous_state=[],
+            model_name: str = "",
+            mode: str = "",
+            iteration: str = "",
+            sharpe_factor: float = 0.5,
+            returns_factor: float = 0.5,
+            max_episode_length: int = 90,  # number of days per episode
+            cash_scaling: float = 1000.0  # RL sees cash as (actual_cash / cash_scaling)
+    ):
+        super().__init__()
+        self.cash_scaling = cash_scaling
+
+        # Save dataframe and trading parameters.
+        self.df = df.copy()
+        self.stock_dim = stock_dim
+        self.hmax = hmax
+        self.num_stock_shares = num_stock_shares
+
+        # Save the original (unscaled) cash and initialize actual cash.
+        self.original_cash = initial_amount
+        self.actual_cash = initial_amount
+
+        self.buy_cost_pct = buy_cost_pct
+        self.sell_cost_pct = sell_cost_pct
+        self.reward_scaling = reward_scaling
+        self.state_space = state_space
+        self.action_space_dim = action_space
+        self.tech_indicator_list = tech_indicator_list
+
+        # Define action and observation spaces.
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.action_space_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_space,), dtype=np.float32)
+
+        # Set initial day and get the first data row.
+        self.day = day
+        self.data = self.df.iloc[self.day]
+        self.unique_days = np.array(sorted(self.df["date"].unique()))
+        print("UNQEDAYS", len(self.unique_days))
+        self.max_episode_length = max_episode_length
+
+        self.turbulence_threshold = turbulence_threshold
+        self.risk_indicator_col = risk_indicator_col
+        self.make_plots = make_plots
+        self.print_verbosity = print_verbosity
+        self.initial = initial
+        self.previous_state = previous_state
+        self.model_name = model_name
+        self.mode = mode
+        self.iteration = iteration
+        self.sharpe_factor = sharpe_factor
+        self.returns_factor = returns_factor
+        self.short_term_factor = 0.0
+        self.activity_factor = 0.001
+        self.inactivity_penalty = 0.1
+
+        self._seed()
+
+        # Episode variables; these are set in reset().
+        self.start_day = 0
+        self.end_day = 0
+        self.terminal = False
+        self.episode = 0
+
+        # Initialize state (observation). Note that the first element (cash) is reported as scaled.
+        self.state = self._initiate_state()
+
+        # Compute the initial total asset using the actual (unscaled) cash.
+        self.asset_memory = [self.actual_cash +
+                             np.sum(np.array(self.num_stock_shares) * np.array(self.state[1:1 + self.stock_dim]))]
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = []
+        self.date_memory = [self._get_date()]
+
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def _initiate_state(self):
+        """
+        Build the initial state vector.
+        The first element is the scaled cash (actual_cash / cash_scaling).
+        The remaining elements include close prices, current stock holdings, and technical indicators.
+        """
+        if self.initial:
+            if len(self.df.tic.unique()) > 1:
+                # Multiple stocks:
+                close_prices = self.data.close.values.tolist() if hasattr(self.data.close, "values") else [
+                    self.data.close]
+                tech_data = []
+                for tech in self.tech_indicator_list:
+                    if hasattr(self.data[tech], "values"):
+                        tech_data.extend(self.data[tech].values.tolist())
+                    else:
+                        tech_data.append(self.data[tech])
+                state = ([self.actual_cash / self.cash_scaling] + close_prices + self.num_stock_shares + tech_data)
+            else:
+                # Single stock:
+                state = ([self.actual_cash / self.cash_scaling] +
+                         [self.data.close] +
+                         [0] * self.stock_dim +
+                         sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        else:
+            if len(self.df.tic.unique()) > 1:
+                if hasattr(self.data.close, "values"):
+                    close_prices = self.data.close.values.tolist()
+                else:
+                    close_prices = [self.data.close]
+                tech_data = []
+                for tech in self.tech_indicator_list:
+                    if hasattr(self.data[tech], "values"):
+                        tech_data.extend(self.data[tech].values.tolist())
+                    else:
+                        tech_data.append(self.data[tech])
+                state = ([self.previous_state[0]] + close_prices +
+                         self.previous_state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)] + tech_data)
+            else:
+                state = ([self.previous_state[0]] +
+                         [self.data.close] +
+                         self.previous_state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)] +
+                         sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        return state
+
+    def _update_state(self):
+        """
+        Update the state vector for the new day.
+        The first element (cash) is reported as scaled.
+        """
+        if len(self.df.tic.unique()) > 1:
+            state = ([self.actual_cash / self.cash_scaling] +
+                     self.data.close.values.tolist() +
+                     list(self.state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)]) +
+                     sum((self.data[tech].values.tolist() for tech in self.tech_indicator_list), []))
+        else:
+            state = ([self.actual_cash / self.cash_scaling] +
+                     [self.data.close] +
+                     list(self.state[(self.stock_dim + 1):(self.stock_dim * 2 + 1)]) +
+                     sum(([self.data[tech]] for tech in self.tech_indicator_list), []))
+        return state
+
+    def _get_date(self):
+        """Return the current date from the data row."""
+        if len(self.df.tic.unique()) > 1:
+            date_val = self.data.date
+            if hasattr(date_val, "unique"):
+                date = self.data.date.unique()[0]
+            else:
+                date = date_val
+        else:
+            date = self.data.date
+        return date
+
+    def _sell_stock(self, index, action):
+        """Execute a sell order and update actual cash."""
+
+        def _do_sell_normal():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+                if self.state[index + self.stock_dim + 1] > 0:
+                    sell_num_shares = min(abs(action), self.state[index + self.stock_dim + 1])
+                    sell_amount = self.state[index + 1] * sell_num_shares * (1 - self.sell_cost_pct[index])
+                    self.actual_cash += sell_amount
+                    self.state[index + self.stock_dim + 1] -= sell_num_shares
+                    self.cost += self.state[index + 1] * sell_num_shares * self.sell_cost_pct[index]
+                    self.trades += 1
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = 0
+            return sell_num_shares
+
+        if self.turbulence_threshold is not None:
+            if self.turbulence >= self.turbulence_threshold:
+                if self.state[index + 1] > 0:
+                    if self.state[index + self.stock_dim + 1] > 0:
+                        sell_num_shares = self.state[index + self.stock_dim + 1]
+                        sell_amount = self.state[index + 1] * sell_num_shares * (1 - self.sell_cost_pct[index])
+                        self.actual_cash += sell_amount
+                        self.state[index + self.stock_dim + 1] = 0
+                        self.cost += self.state[index + 1] * sell_num_shares * self.sell_cost_pct[index]
+                        self.trades += 1
+                    else:
+                        sell_num_shares = 0
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = _do_sell_normal()
+        else:
+            sell_num_shares = _do_sell_normal()
+        return sell_num_shares
+
+    def _buy_stock(self, index, action):
+        """Execute a buy order and update actual cash."""
+
+        def _do_buy():
+            if self.state[index + 2 * self.stock_dim + 1] != True:
+                available_amount = self.actual_cash // (self.state[index + 1] * (1 + self.buy_cost_pct[index]))
+                buy_num_shares = min(available_amount, action)
+                buy_amount = self.state[index + 1] * buy_num_shares * (1 + self.buy_cost_pct[index])
+                self.actual_cash -= buy_amount
+                self.state[index + self.stock_dim + 1] += buy_num_shares
+                self.cost += self.state[index + 1] * buy_num_shares * self.buy_cost_pct[index]
+                self.trades += 1
+            else:
+                buy_num_shares = 0
+            return buy_num_shares
+
+        if self.turbulence_threshold is None:
+            buy_num_shares = _do_buy()
+        else:
+            if self.turbulence < self.turbulence_threshold:
+                buy_num_shares = _do_buy()
+            else:
+                buy_num_shares = 0
+        return buy_num_shares
+
+    def step(self, actions):
+        """
+        Take an action for one day, update state and reward, and move forward one day.
+        Returns: (state, reward, done, truncated, info)
+        """
+
+        def compute_sharpe_ratio(returns):
+            return np.mean(returns) / (np.std(returns) + 1e-9)
+
+        # Determine current day offset.
+        current_date = str(self._get_date())
+        unique_days_str = np.array([str(d) for d in self.unique_days])
+        day_index_in_unique = np.where(unique_days_str == current_date)[0][0]
+        day_offset = day_index_in_unique - self.start_day
+
+        if day_offset >= self.max_episode_length - 1 or self.day >= self.df.index[-1]:
+            return self.state, 0.0, True, False, {}
+
+        actions = actions * self.hmax
+        actions = actions.astype(int)
+        actions = np.atleast_1d(actions)
+
+        # Compute the initial total asset (using actual cash).
+        begin_total_asset = self.actual_cash + sum(
+            np.array(self.state[1:1 + self.stock_dim]) *
+            np.array(self.state[self.stock_dim + 1:self.stock_dim * 2 + 1])
+        )
+
+        # Process sell orders.
+        for index in np.argsort(actions)[:np.where(actions < 0)[0].shape[0]]:
+            actions[index] = self._sell_stock(index, actions[index]) * (-1)
+        # Process buy orders.
+        for index in np.argsort(actions)[::-1][:np.where(actions > 0)[0].shape[0]]:
+            actions[index] = self._buy_stock(index, actions[index])
+
+        self.day += 1
+        if self.day >= len(self.df):
+            return self.state, 0.0, True, False, {}
+
+        self.data = self.df.loc[self.day, :]
+        self.state = self._update_state()
+
+        # Compute the new total asset.
+        end_total_asset = self.actual_cash + sum(
+            np.array(self.state[1:1 + self.stock_dim]) *
+            np.array(self.state[self.stock_dim + 1:self.stock_dim * 2 + 1])
+        )
+        trade_profit = end_total_asset - begin_total_asset
+        trading_cost_penalty = self.cost * 0.01
+        immediate_reward = trade_profit - trading_cost_penalty
+
+        if len(self.rewards_memory) > 1:
+            returns = np.diff(self.asset_memory) / self.asset_memory[:-1]
+            sharpe_reward = compute_sharpe_ratio(returns)
+        else:
+            sharpe_reward = 0
+
+        # Compute portfolio reward.
+        portfolio_reward = self.returns_factor * immediate_reward + self.sharpe_factor * sharpe_reward
+
+        # Scale the reward by reward_scaling and also divide by cash_scaling so that it is consistent with the scaled cash.
+        reward = (portfolio_reward * self.reward_scaling) / self.cash_scaling
+        reward = np.clip(reward, -10, 10)
+        self.reward = reward
+
+        self.asset_memory.append(end_total_asset)
+        self.rewards_memory.append(self.reward)
+        self.state_memory.append(self.state)
+        self.date_memory.append(self._get_date())
+        self.actions_memory.append(actions.tolist())
+
+        info = {"current_obs": self.state,
+                "date": pd.to_datetime(self._get_date()).strftime("%Y-%m-%d")}
+        return self.state, self.reward, False, False, info
+
+    def reset(self, *, seed=None, options=None):
+        """
+        Reset the environment for a new episode.
+        Randomly select a start day such that there are enough days for the episode.
+        """
+        max_start = len(self.unique_days) - self.max_episode_length
+        self.start_day = np.random.randint(0, max_start)
+        self.end_day = self.start_day + self.max_episode_length
+
+        start_date = self.unique_days[self.start_day]
+        start_rows = self.df[self.df["date"] == start_date]
+        if len(start_rows) == 0:
+            raise ValueError("No rows found for start_date. Check your data.")
+        self.day = start_rows.index[0]
+
+        self.terminal = False
+        self.episode += 1
+        self.data = self.df.loc[self.day, :]
+
+        # Reset actual cash to the original unscaled value.
+        self.actual_cash = self.original_cash
+
+        self.state = self._initiate_state()
+        self.reward = 0
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+
+        self.asset_memory = [self.actual_cash +
+                             np.sum(np.array(self.num_stock_shares) * np.array(self.state[1:1 + self.stock_dim]))]
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = []
+        self.date_memory = [self._get_date()]
+
+        return self.state, {}
+
+    def render(self, mode="human", close=False):
+        return self.state
+
+    def save_state_memory(self):
+        if len(self.df.tic.unique()) > 1:
+            date_list = self.date_memory[:-1]
+            df_date = pd.DataFrame(date_list, columns=["date"])
+            df_states = pd.DataFrame(self.state_memory)
+            df_states.index = df_date["date"]
+        else:
+            df_states = pd.DataFrame({"date": self.date_memory[:-1], "states": self.state_memory})
+        return df_states
+
+    def save_asset_memory(self):
+        df_account_value = pd.DataFrame({"date": self.date_memory, "account_value": self.asset_memory})
+        return df_account_value
+
+    def save_action_memory(self):
+        min_length = min(len(self.date_memory), len(self.actions_memory))
+        if min_length == 0:
+            return pd.DataFrame(columns=["date", "actions"])
+        date_list = self.date_memory[:min_length]
+        action_list = self.actions_memory[:min_length]
+        if len(self.df.tic.unique()) > 1:
+            df_date = pd.DataFrame({"date": date_list})
+            df_actions = pd.DataFrame(action_list)
+            if df_actions.shape[1] == len(self.data.tic.values):
+                df_actions.columns = self.data.tic.values
+            else:
+                df_actions.columns = [f"Stock_{i}" for i in range(df_actions.shape[1])]
+            df_actions.index = df_date["date"]
+        else:
+            df_actions = pd.DataFrame({"date": date_list, "actions": action_list})
+        print(f"🔹 Saved {len(df_actions)} action records.")
+        return df_actions
+
+    def get_sb_env(self):
+        from stable_baselines3.common.vec_env import DummyVecEnv
         e = DummyVecEnv([lambda: self])
         obs = e.reset()
         return e, obs
