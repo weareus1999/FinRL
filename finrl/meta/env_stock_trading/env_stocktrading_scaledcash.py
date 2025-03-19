@@ -2016,7 +2016,6 @@ class StockTradingEnvRandomStartsPrescaled(gym.Env):
 
         # Compute portfolio reward.
         portfolio_reward = self.returns_factor * immediate_reward + self.sharpe_factor * sharpe_reward
-
         # Scale the reward by reward_scaling and also divide by cash_scaling so that it is consistent with the scaled cash.
         reward = (portfolio_reward * self.reward_scaling) / self.cash_scaling
         reward = np.clip(reward, -10, 10)
